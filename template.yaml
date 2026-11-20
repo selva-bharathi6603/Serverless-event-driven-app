@@ -1,0 +1,560 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Serverless event-driven app: HTTP API + Lambda + DynamoDB, S3 upload pipeline
+  (S3 -> Lambda -> SQS -> Lambda -> SNS), scheduled AWS cleanup via EventBridge,
+  secrets in Secrets Manager, CloudWatch dashboard and alarms.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: serverless-demo
+    AllowedPattern: "^[a-z0-9][a-z0-9-]{2,30}$"
+    Description: Lowercase prefix for resource names. Use the same value as the stack name.
+  AlertEmail:
+    Type: String
+    AllowedPattern: "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$"
+    Description: Email that receives file notifications, cleanup reports and alarms.
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+    AllowedValues: [7, 14, 30, 90]
+  CleanupDryRun:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: When true the cleanup Lambda only reports and never stops instances.
+  CleanupSchedule:
+    Type: String
+    Default: "cron(30 12 * * ? *)"
+    Description: EventBridge schedule in UTC (12:30 UTC = 18:00 IST).
+  IdleCpuThreshold:
+    Type: Number
+    Default: 5
+    Description: Average CPU % below which a tagged instance counts as idle.
+
+Resources:
+  # ---------------------------------------------------------------- Secrets
+  AppSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${ProjectName}/app-secrets"
+      Description: API key for clients (auto-generated) and optional webhook URL for reports.
+      GenerateSecretString:
+        SecretStringTemplate: '{"webhook_url": ""}'
+        GenerateStringKey: api_key
+        PasswordLength: 40
+        ExcludePunctuation: true
+
+  # ---------------------------------------------------------------- Data
+  ItemsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+
+  UploadsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: object_key
+          AttributeType: S
+      KeySchema:
+        - AttributeName: object_key
+          KeyType: HASH
+
+  UploadBucket:
+    Type: AWS::S3::Bucket
+    DependsOn: ProcessorInvokePermission
+    Properties:
+      BucketName: !Sub "${ProjectName}-uploads-${AWS::AccountId}-${AWS::Region}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: "s3:ObjectCreated:*"
+            Function: !GetAtt ProcessorFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: uploads/
+
+  # ---------------------------------------------------------------- Messaging
+  ResultsDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+
+  ResultsQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 180
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ResultsDLQ.Arn
+        maxReceiveCount: 3
+
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+
+  NotificationEmail:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref NotificationTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  # ---------------------------------------------------------------- Log groups
+  ApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: !Ref LogRetentionDays
+  ProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: !Ref LogRetentionDays
+  NotifierLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: !Ref LogRetentionDays
+  CleanupLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: !Ref LogRetentionDays
+
+  # ---------------------------------------------------------------- IAM roles (one per function, least privilege)
+  ApiFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: api-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Scan
+                Resource: !GetAtt ItemsTable.Arn
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref AppSecret
+
+  ProcessorFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: processor-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: s3:GetObject
+                # Built from a string (not GetAtt) to avoid a circular dependency with the bucket.
+                Resource: !Sub "arn:aws:s3:::${ProjectName}-uploads-${AWS::AccountId}-${AWS::Region}/uploads/*"
+              - Effect: Allow
+                Action: dynamodb:PutItem
+                Resource: !GetAtt UploadsTable.Arn
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt ResultsQueue.Arn
+
+  NotifierFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: notifier-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt ResultsQueue.Arn
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref NotificationTopic
+
+  CleanupFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: cleanup-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:DescribeVolumes
+                  - ec2:DescribeAddresses
+                  - cloudwatch:GetMetricStatistics
+                Resource: "*"
+              - Effect: Allow
+                Action: ec2:StopInstances
+                Resource: !Sub "arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
+                Condition:
+                  StringEquals:
+                    "aws:ResourceTag/AutoStop": "true"
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref NotificationTopic
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref AppSecret
+
+  # ---------------------------------------------------------------- Lambda functions
+  ApiFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: REST handler for /items (API key checked against Secrets Manager)
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: app.handler
+      Code: src/api
+      Role: !GetAtt ApiFunctionRole.Arn
+      Timeout: 10
+      MemorySize: 256
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref ItemsTable
+          SECRET_ARN: !Ref AppSecret
+      LoggingConfig:
+        LogFormat: JSON
+        ApplicationLogLevel: INFO
+        SystemLogLevel: WARN
+        LogGroup: !Ref ApiLogGroup
+
+  ProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Processes files uploaded to S3, stores the result and queues a message
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: app.handler
+      Code: src/processor
+      Role: !GetAtt ProcessorFunctionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref UploadsTable
+          QUEUE_URL: !Ref ResultsQueue
+      LoggingConfig:
+        LogFormat: JSON
+        ApplicationLogLevel: INFO
+        SystemLogLevel: WARN
+        LogGroup: !Ref ProcessorLogGroup
+
+  NotifierFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Reads processing results from SQS and publishes them to SNS
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: app.handler
+      Code: src/notifier
+      Role: !GetAtt NotifierFunctionRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      Environment:
+        Variables:
+          TOPIC_ARN: !Ref NotificationTopic
+      LoggingConfig:
+        LogFormat: JSON
+        ApplicationLogLevel: INFO
+        SystemLogLevel: WARN
+        LogGroup: !Ref NotifierLogGroup
+
+  CleanupFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Daily report of idle EC2, unattached EBS volumes and unused Elastic IPs
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: app.handler
+      Code: src/cleanup
+      Role: !GetAtt CleanupFunctionRole.Arn
+      Timeout: 60
+      MemorySize: 128
+      Environment:
+        Variables:
+          TOPIC_ARN: !Ref NotificationTopic
+          SECRET_ARN: !Ref AppSecret
+          DRY_RUN: !Ref CleanupDryRun
+          CPU_THRESHOLD: !Ref IdleCpuThreshold
+          LOOKBACK_HOURS: "24"
+      LoggingConfig:
+        LogFormat: JSON
+        ApplicationLogLevel: INFO
+        SystemLogLevel: WARN
+        LogGroup: !Ref CleanupLogGroup
+
+  # ---------------------------------------------------------------- Triggers
+  ProcessorInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ProcessorFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !Sub "arn:aws:s3:::${ProjectName}-uploads-${AWS::AccountId}-${AWS::Region}"
+
+  NotifierQueueMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt ResultsQueue.Arn
+      FunctionName: !Ref NotifierFunction
+      BatchSize: 10
+      FunctionResponseTypes: [ReportBatchItemFailures]
+
+  CleanupRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Scheduled AWS cleanup report
+      ScheduleExpression: !Ref CleanupSchedule
+      State: ENABLED
+      Targets:
+        - Id: cleanup-lambda
+          Arn: !GetAtt CleanupFunction.Arn
+
+  CleanupInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CleanupFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt CleanupRule.Arn
+
+  # ---------------------------------------------------------------- HTTP API
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub "${ProjectName}-api"
+      ProtocolType: HTTP
+
+  ApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt ApiFunction.Arn
+      PayloadFormatVersion: "2.0"
+
+  RouteHealth:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: "GET /health"
+      Target: !Sub "integrations/${ApiIntegration}"
+  RouteCreateItem:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: "POST /items"
+      Target: !Sub "integrations/${ApiIntegration}"
+  RouteListItems:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: "GET /items"
+      Target: !Sub "integrations/${ApiIntegration}"
+  RouteGetItem:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: "GET /items/{id}"
+      Target: !Sub "integrations/${ApiIntegration}"
+  RouteDeleteItem:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: "DELETE /items/{id}"
+      Target: !Sub "integrations/${ApiIntegration}"
+
+  ApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: "$default"
+      AutoDeploy: true
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 20
+        ThrottlingRateLimit: 10
+
+  ApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ApiFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/*"
+
+  # ---------------------------------------------------------------- Alarms
+  ApiErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: API Lambda reported errors
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - { Name: FunctionName, Value: !Ref ApiFunction }
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref NotificationTopic]
+  ProcessorErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Processor Lambda reported errors
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - { Name: FunctionName, Value: !Ref ProcessorFunction }
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref NotificationTopic]
+  NotifierErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Notifier Lambda reported errors
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - { Name: FunctionName, Value: !Ref NotifierFunction }
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref NotificationTopic]
+  CleanupErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Cleanup Lambda reported errors
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - { Name: FunctionName, Value: !Ref CleanupFunction }
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref NotificationTopic]
+  DlqMessagesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Messages landed in the dead-letter queue
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - { Name: QueueName, Value: !GetAtt ResultsDLQ.QueueName }
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref NotificationTopic]
+  Api5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: HTTP API returned 5xx responses
+      Namespace: AWS/ApiGateway
+      MetricName: 5xx
+      Dimensions:
+        - { Name: ApiId, Value: !Ref HttpApi }
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref NotificationTopic]
+
+  # ---------------------------------------------------------------- Dashboard
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub "${ProjectName}-dashboard"
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {"type":"metric","x":0,"y":0,"width":12,"height":6,"properties":{"title":"HTTP API requests and errors","region":"${AWS::Region}","stat":"Sum","period":300,"view":"timeSeries","metrics":[["AWS/ApiGateway","Count","ApiId","${HttpApi}"],["AWS/ApiGateway","4xx","ApiId","${HttpApi}"],["AWS/ApiGateway","5xx","ApiId","${HttpApi}"]]}},
+            {"type":"metric","x":12,"y":0,"width":12,"height":6,"properties":{"title":"HTTP API latency (p90, ms)","region":"${AWS::Region}","stat":"p90","period":300,"view":"timeSeries","metrics":[["AWS/ApiGateway","Latency","ApiId","${HttpApi}"]]}},
+            {"type":"metric","x":0,"y":6,"width":12,"height":6,"properties":{"title":"Lambda invocations","region":"${AWS::Region}","stat":"Sum","period":300,"view":"timeSeries","metrics":[["AWS/Lambda","Invocations","FunctionName","${ApiFunction}"],["AWS/Lambda","Invocations","FunctionName","${ProcessorFunction}"],["AWS/Lambda","Invocations","FunctionName","${NotifierFunction}"],["AWS/Lambda","Invocations","FunctionName","${CleanupFunction}"]]}},
+            {"type":"metric","x":12,"y":6,"width":12,"height":6,"properties":{"title":"Lambda errors","region":"${AWS::Region}","stat":"Sum","period":300,"view":"timeSeries","metrics":[["AWS/Lambda","Errors","FunctionName","${ApiFunction}"],["AWS/Lambda","Errors","FunctionName","${ProcessorFunction}"],["AWS/Lambda","Errors","FunctionName","${NotifierFunction}"],["AWS/Lambda","Errors","FunctionName","${CleanupFunction}"]]}},
+            {"type":"metric","x":0,"y":12,"width":12,"height":6,"properties":{"title":"Queue depth (main vs dead-letter)","region":"${AWS::Region}","stat":"Maximum","period":300,"view":"timeSeries","metrics":[["AWS/SQS","ApproximateNumberOfMessagesVisible","QueueName","${ResultsQueue.QueueName}"],["AWS/SQS","ApproximateNumberOfMessagesVisible","QueueName","${ResultsDLQ.QueueName}"]]}}
+          ]
+        }
+
+Outputs:
+  ApiUrl:
+    Description: Base URL of the HTTP API
+    Value: !GetAtt HttpApi.ApiEndpoint
+  UploadBucketName:
+    Description: Upload files under the uploads/ prefix to trigger processing
+    Value: !Sub "${ProjectName}-uploads-${AWS::AccountId}-${AWS::Region}"
+  SecretArn:
+    Description: Secret holding the API key and optional webhook URL
+    Value: !Ref AppSecret
+  DashboardUrl:
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-dashboard"

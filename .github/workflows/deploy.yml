@@ -1,0 +1,59 @@
+name: test-and-deploy
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  id-token: write   # needed to request the OIDC token
+  contents: read
+
+env:
+  AWS_REGION: ap-south-1
+  STACK_NAME: serverless-demo
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements-dev.txt
+      - name: Lint CloudFormation
+        run: cfn-lint template.yaml bootstrap/github-oidc.yaml --ignore-checks W3002
+      - name: Unit tests
+        run: pytest -q
+
+  deploy:
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Package
+        run: |
+          aws cloudformation package \
+            --template-file template.yaml \
+            --s3-bucket "${{ vars.ARTIFACT_BUCKET }}" \
+            --output-template-file packaged.yaml
+      - name: Deploy
+        run: |
+          aws cloudformation deploy \
+            --template-file packaged.yaml \
+            --stack-name "$STACK_NAME" \
+            --capabilities CAPABILITY_IAM \
+            --parameter-overrides ProjectName="$STACK_NAME" AlertEmail="${{ vars.ALERT_EMAIL }}" \
+            --no-fail-on-empty-changeset
+      - name: Smoke test
+        run: |
+          API_URL=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+            --query "Stacks[0].Outputs[?OutputKey=='ApiUrl'].OutputValue" --output text)
+          curl --fail --silent --show-error "$API_URL/health"

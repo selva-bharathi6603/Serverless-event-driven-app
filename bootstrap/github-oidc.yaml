@@ -1,0 +1,183 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  One-time bootstrap. Creates the artifact bucket and an IAM role that GitHub
+  Actions assumes through OIDC, so no AWS access keys are stored in GitHub.
+
+Parameters:
+  GitHubOrg:
+    Type: String
+    Description: GitHub user or organisation that owns the repo.
+  GitHubRepo:
+    Type: String
+    Description: Repository name.
+  ProjectName:
+    Type: String
+    Default: serverless-demo
+    Description: Must match the main stack name and its ProjectName parameter.
+  CreateOIDCProvider:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Set to false if this account already has the GitHub OIDC provider.
+
+Conditions:
+  CreateProvider: !Equals [!Ref CreateOIDCProvider, "true"]
+
+Resources:
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: CreateProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList:
+        - sts.amazonaws.com
+
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-artifacts-${AWS::AccountId}-${AWS::Region}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  GitHubDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-github-deploy"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub "arn:aws:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com"
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                "token.actions.githubusercontent.com:aud": sts.amazonaws.com
+              StringLike:
+                "token.actions.githubusercontent.com:sub": !Sub "repo:${GitHubOrg}/${GitHubRepo}:ref:refs/heads/main"
+      Policies:
+        - PolicyName: deploy-serverless-stack
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: CloudFormationOwnStack
+                Effect: Allow
+                Action: "cloudformation:*"
+                Resource: !Sub "arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${ProjectName}/*"
+              - Sid: CloudFormationValidate
+                Effect: Allow
+                Action: [cloudformation:ValidateTemplate, cloudformation:GetTemplateSummary]
+                Resource: "*"
+              - Sid: ArtifactBucket
+                Effect: Allow
+                Action: [s3:PutObject, s3:GetObject, s3:ListBucket, s3:GetBucketLocation]
+                Resource:
+                  - !Sub "arn:aws:s3:::${ProjectName}-artifacts-${AWS::AccountId}-${AWS::Region}"
+                  - !Sub "arn:aws:s3:::${ProjectName}-artifacts-${AWS::AccountId}-${AWS::Region}/*"
+              - Sid: UploadBucket
+                Effect: Allow
+                Action: "s3:*"
+                Resource:
+                  - !Sub "arn:aws:s3:::${ProjectName}-uploads-${AWS::AccountId}-${AWS::Region}"
+                  - !Sub "arn:aws:s3:::${ProjectName}-uploads-${AWS::AccountId}-${AWS::Region}/*"
+              - Sid: IamRolesOfStack
+                Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:GetRole
+                  - iam:PassRole
+                  - iam:TagRole
+                  - iam:UntagRole
+                  - iam:UpdateAssumeRolePolicy
+                  - iam:PutRolePolicy
+                  - iam:GetRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:ListRolePolicies
+                  - iam:ListAttachedRolePolicies
+                Resource: !Sub "arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-*"
+              - Sid: LambdaFunctions
+                Effect: Allow
+                Action: "lambda:*"
+                Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}-*"
+              - Sid: LambdaEventSourceMappings
+                Effect: Allow
+                Action:
+                  - lambda:CreateEventSourceMapping
+                  - lambda:UpdateEventSourceMapping
+                  - lambda:DeleteEventSourceMapping
+                  - lambda:GetEventSourceMapping
+                  - lambda:ListEventSourceMappings
+                Resource: "*"
+              - Sid: DynamoDbTables
+                Effect: Allow
+                Action: "dynamodb:*"
+                Resource: !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ProjectName}-*"
+              - Sid: Messaging
+                Effect: Allow
+                Action: ["sqs:*", "sns:*"]
+                Resource:
+                  - !Sub "arn:aws:sqs:${AWS::Region}:${AWS::AccountId}:${ProjectName}-*"
+                  - !Sub "arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${ProjectName}-*"
+              - Sid: EventBridgeRules
+                Effect: Allow
+                Action: "events:*"
+                Resource: !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/${ProjectName}-*"
+              - Sid: LogGroups
+                Effect: Allow
+                Action: "logs:*"
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${ProjectName}-*"
+              - Sid: LogGroupsDescribe
+                Effect: Allow
+                Action: [logs:DescribeLogGroups, logs:ListTagsForResource]
+                Resource: "*"
+              - Sid: CloudWatchAlarmsAndDashboard
+                Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricAlarm
+                  - cloudwatch:DeleteAlarms
+                  - cloudwatch:DescribeAlarms
+                  - cloudwatch:TagResource
+                  - cloudwatch:ListTagsForResource
+                  - cloudwatch:PutDashboard
+                  - cloudwatch:GetDashboard
+                  - cloudwatch:DeleteDashboards
+                Resource: "*"
+              - Sid: HttpApi
+                Effect: Allow
+                Action: "apigateway:*"
+                Resource:
+                  - !Sub "arn:aws:apigateway:${AWS::Region}::/apis"
+                  - !Sub "arn:aws:apigateway:${AWS::Region}::/apis/*"
+                  - !Sub "arn:aws:apigateway:${AWS::Region}::/tags/*"
+              - Sid: Secret
+                Effect: Allow
+                Action:
+                  - secretsmanager:CreateSecret
+                  - secretsmanager:DeleteSecret
+                  - secretsmanager:DescribeSecret
+                  - secretsmanager:UpdateSecret
+                  - secretsmanager:TagResource
+                  - secretsmanager:GetResourcePolicy
+                Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${ProjectName}/*"
+              - Sid: SecretRandomPassword
+                Effect: Allow
+                Action: secretsmanager:GetRandomPassword
+                Resource: "*"
+
+Outputs:
+  DeployRoleArn:
+    Description: Save as the AWS_ROLE_ARN repository variable in GitHub
+    Value: !GetAtt GitHubDeployRole.Arn
+  ArtifactBucketName:
+    Description: Save as the ARTIFACT_BUCKET repository variable in GitHub
+    Value: !Ref ArtifactBucket
