@@ -170,3 +170,5 @@ aws cloudformation delete-stack --stack-name serverless-demo-bootstrap
 ## Resume bullet
 
 Designed a serverless event-driven system (API Gateway, Lambda, DynamoDB, SQS, SNS, EventBridge) deployed with CloudFormation and GitHub Actions OIDC; secured API access with Secrets Manager and automated AWS idle-resource reporting with Python.
+
+> The stack was deployed through GitHub Actions with OIDC, tested, and then destroyed to avoid AWS charges. Follow the steps above to redeploy.
