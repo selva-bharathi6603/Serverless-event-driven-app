@@ -14,29 +14,9 @@ An event-driven backend built only from serverless services and deployed with
 
 ## Architecture
 
-```mermaid
-flowchart LR
-  client([Client]) -->|x-api-key| apigw[API Gateway HTTP API]
-  apigw --> api[Lambda: api]
-  api --> items[(DynamoDB: items)]
-  api -.->|read key| sm[[Secrets Manager]]
+<img src="docs/architecture.png" alt="Architecture diagram with AWS service icons" width="900">
 
-  user([Uploader]) --> s3[(S3 uploads/)]
-  s3 -->|ObjectCreated| proc[Lambda: processor]
-  proc --> uploads[(DynamoDB: uploads)]
-  proc --> sqs[[SQS results queue]]
-  sqs -->|after 3 failed receives| dlq[[Dead-letter queue]]
-  sqs --> notif[Lambda: notifier]
-  notif --> sns((SNS topic))
-
-  eb[EventBridge schedule] --> clean[Lambda: cleanup]
-  clean --> ec2[EC2 / EBS / EIP]
-  clean --> sns
-  clean -.-> sm
-  sns --> email([Email])
-
-  cw[CloudWatch alarms and dashboard] --> sns
-```
+The diagram is generated from code (`docs/architecture.py`, using the `diagrams` library) so it stays in sync with the stack.
 
 ## Screenshots
 
@@ -128,12 +108,26 @@ Results of the S3 upload pipeline stored by the processor Lambda:
 ## Repository layout
 
 ```
-template.yaml               main CloudFormation stack
-bootstrap/github-oidc.yaml  one-time: OIDC provider, deploy role, artifact bucket
-src/api, processor, notifier, cleanup   Lambda code (Python 3.12, arm64)
-tests/test_lambdas.py       unit tests using moto (no AWS account needed)
-scripts/                    deploy.sh, test_flow.sh, teardown.sh
-.github/workflows/deploy.yml   lint + test on PRs, deploy on push to main
+.
+|-- template.yaml                  main CloudFormation stack
+|-- bootstrap/
+|   `-- github-oidc.yaml           one-time: OIDC provider, deploy role, bucket
+|-- src/
+|   |-- api/                       REST API Lambda
+|   |-- processor/                 S3 upload processor Lambda
+|   |-- notifier/                  SQS to SNS notifier Lambda
+|   `-- cleanup/                   scheduled idle-resource report Lambda
+|-- tests/
+|   `-- test_lambdas.py            unit tests using moto (no AWS account)
+|-- scripts/
+|   |-- deploy.sh                  manual deploy
+|   |-- test_flow.sh               end-to-end check
+|   `-- teardown.sh                delete everything
+|-- docs/
+|   |-- architecture.png           architecture diagram
+|   |-- architecture.py            diagram source (diagrams library)
+|   `-- screenshots/               proof of the working system
+`-- .github/workflows/deploy.yml   lint and test on PRs, deploy on push to main
 ```
 
 ## Prerequisites
